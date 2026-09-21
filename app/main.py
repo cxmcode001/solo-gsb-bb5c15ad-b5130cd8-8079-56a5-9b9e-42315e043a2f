@@ -19,6 +19,7 @@ from .genealogy import (
     genealogy,
 )
 from .gs1 import GS1ParseError, parse
+from .packing import PackingAuditError, PackingStructureError, audit_packing
 from .pickplan import DemandValidationError, pick_plan
 from .recall import ItemConflictError, RuleValidationError, assess
 from .summary import WeightSummaryError, summarize
@@ -26,7 +27,7 @@ from .traceaudit import EventConflictError, TraceAuditError, audit
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -86,7 +87,20 @@ app = FastAPI(
         "rejects the whole request. The response lists the processes in "
         "that stable order with per-batch inputs/outputs and "
         "input/output/loss weights, plus the final balance of every "
-        "batch."
+        "batch. POST /packing-audit audits a packing hierarchy: every "
+        "container carries a unique container_id, an optional parent_id "
+        "(the relations must form a forest -- unknown parents, cycles "
+        "and duplicate ids reject the whole request with 422), an "
+        "optional max_weight in the target unit and the scans of the "
+        "items loaded directly into it (each with exactly one AI 01, "
+        "exactly one AI 21 and one weight AI). A physical item "
+        "(GTIN + serial number) may be loaded only once across the "
+        "whole request. Weights are aggregated from the leaves to the "
+        "roots with exact Decimal arithmetic; the response keeps the "
+        "request order and reports per container the direct/total "
+        "weight, the remaining capacity, the direct/recursive item "
+        "counts and an over_limit flag when its total exceeds "
+        "max_weight."
     ),
 )
 
@@ -631,6 +645,136 @@ class BatchGenealogyResponse(BaseModel):
     batches: list[BatchBalance]
 
 
+class PackingContainer(BaseModel):
+    """One container of the packing hierarchy with its directly loaded items."""
+
+    container_id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Container identifier; must be unique within one request "
+            "(a duplicate is rejected with 422)."
+        ),
+        examples=["BOX-1"],
+    )
+    parent_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional container_id of the container this one is loaded "
+            "into; omitted or null makes it a root. The parent/child "
+            "relations must form a forest: an unknown parent, a cycle "
+            "(a container naming itself included) or a duplicate "
+            "container_id rejects the whole request with 422."
+        ),
+        examples=["PALLET-1"],
+    )
+    max_weight: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional weight limit of the container -- its own items plus "
+            "everything packed inside it -- expressed in target_unit. A "
+            "container whose total_weight exceeds it is flagged over_limit "
+            "(the audit result is still returned in full) and its "
+            "remaining_capacity goes negative."
+        ),
+        examples=[25],
+    )
+    items: list[str] = Field(
+        ...,
+        description=(
+            "Raw GS1 scan strings and/or GS1 Digital Link URIs of the "
+            "items loaded directly into this container. Each must contain "
+            "exactly one AI 01 (GTIN), exactly one AI 21 (serial number) "
+            "and exactly one weight AI 310n/320n; AI 10/17 are ignored. "
+            "A physical item (GTIN + serial number) may be loaded only "
+            "once across the whole request."
+        ),
+        examples=[["010950110153000321SN0001\x1d3103002000"]],
+    )
+
+
+class PackingAuditRequest(BaseModel):
+    target_unit: Literal["kg", "lb"] = Field(
+        default="kg",
+        description='Unit of every weight in the response: "kg" or "lb" (default "kg").',
+    )
+    containers: list[PackingContainer] = Field(
+        ...,
+        description=(
+            "Containers in arbitrary order; the response reports them in "
+            "this same request order."
+        ),
+        examples=[
+            [
+                {
+                    "container_id": "BOX-1",
+                    "parent_id": "PALLET-1",
+                    "max_weight": 10,
+                    "items": ["010950110153000321SN0001\x1d3103002000"],
+                },
+                {
+                    "container_id": "PALLET-1",
+                    "items": ["010950110153000321SN0002\x1d3202002513"],
+                },
+            ]
+        ],
+    )
+
+
+class PackingContainerResult(BaseModel):
+    """OpenAPI shape of one audited container; weights render as exact JSON numbers."""
+
+    container_index: int = Field(description="Position of the container in the request")
+    container_id: str = Field(description="Echoed container identifier")
+    parent_id: str | None = Field(
+        description="Echoed parent container identifier; null for roots"
+    )
+    max_weight: float | None = Field(
+        description=(
+            "Echoed weight limit in the target unit (six decimal places); "
+            "null when the container has none"
+        )
+    )
+    direct_weight: float = Field(
+        description=(
+            "Sum of the container's own items' net weights in the target "
+            "unit, rounded to six decimal places with round-half-even. "
+            "Computed internally with Decimal, never float."
+        )
+    )
+    total_weight: float = Field(
+        description=(
+            "direct_weight plus the totals of all descendant containers "
+            "(six decimal places)"
+        )
+    )
+    remaining_capacity: float | None = Field(
+        description=(
+            "max_weight - total_weight (six decimal places); negative when "
+            "the container is over its limit, null when it has no "
+            "max_weight"
+        )
+    )
+    over_limit: bool = Field(
+        description=(
+            "True when the container has a max_weight and its (unrounded) "
+            "total_weight exceeds it"
+        )
+    )
+    direct_item_count: int = Field(
+        description="Number of items loaded directly into this container"
+    )
+    total_item_count: int = Field(
+        description="direct_item_count plus the counts of all descendant containers"
+    )
+
+
+class PackingAuditResponse(BaseModel):
+    target_unit: Literal["kg", "lb"]
+    containers: list[PackingContainerResult]
+
+
 SIX_PLACES = Decimal("0.000001")
 
 
@@ -788,6 +932,35 @@ def _build_genealogy_response(result: dict) -> Response:
     return Response(content=_dump(payload), media_type="application/json")
 
 
+def _build_packing_response(result: dict) -> Response:
+    """Quantize every weight half-even to six places and render exact JSON."""
+
+    def weight_or_none(value: Decimal | None) -> _RawNumber | None:
+        return _six(value) if value is not None else None
+
+    payload = {
+        "target_unit": result["target_unit"],
+        "containers": [
+            {
+                "container_index": container["container_index"],
+                "container_id": container["container_id"],
+                "parent_id": container["parent_id"],
+                "max_weight": weight_or_none(container["max_weight"]),
+                "direct_weight": _six(container["direct_weight"]),
+                "total_weight": _six(container["total_weight"]),
+                "remaining_capacity": weight_or_none(
+                    container["remaining_capacity"]
+                ),
+                "over_limit": container["over_limit"],
+                "direct_item_count": container["direct_item_count"],
+                "total_item_count": container["total_item_count"],
+            }
+            for container in result["containers"]
+        ],
+    }
+    return Response(content=_dump(payload), media_type="application/json")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -883,3 +1056,21 @@ def batch_genealogy(req: BatchGenealogyRequest) -> Response:
     ) as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     return _build_genealogy_response(result)
+
+
+@app.post(
+    "/packing-audit",
+    response_model=PackingAuditResponse,
+)
+def packing_audit(req: PackingAuditRequest) -> Response:
+    try:
+        result = audit_packing(
+            [
+                (c.container_id, c.parent_id, c.max_weight, c.items)
+                for c in req.containers
+            ],
+            req.target_unit,
+        )
+    except (PackingAuditError, PackingStructureError) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return _build_packing_response(result)
