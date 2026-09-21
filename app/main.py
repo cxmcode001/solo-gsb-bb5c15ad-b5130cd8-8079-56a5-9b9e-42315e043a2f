@@ -19,6 +19,7 @@ from .genealogy import (
     genealogy,
 )
 from .gs1 import GS1ParseError, parse
+from .packing import PackingAuditError, PackingStructureError, audit as packing_audit
 from .pickplan import DemandValidationError, pick_plan
 from .recall import ItemConflictError, RuleValidationError, assess
 from .summary import WeightSummaryError, summarize
@@ -26,7 +27,7 @@ from .traceaudit import EventConflictError, TraceAuditError, audit
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -86,7 +87,19 @@ app = FastAPI(
         "rejects the whole request. The response lists the processes in "
         "that stable order with per-batch inputs/outputs and "
         "input/output/loss weights, plus the final balance of every "
-        "batch."
+        "batch. POST /packing-audit audits nested containers (each with "
+        "a unique container_id, an optional parent_id, a non-negative "
+        "max_weight capacity and directly loaded item scans): every item "
+        "scan carries exactly one AI 01, exactly one AI 21 and one "
+        "weight AI 310n/320n, and the same GTIN+serial may be loaded "
+        "only once. The parent links must form a forest -- duplicate "
+        "container ids, unknown parents and parent cycles reject the "
+        "whole request with 422 naming the container (and item) "
+        "indices. Direct item weights and child-container totals are "
+        "rolled up leaves-to-roots with exact Decimal arithmetic; a "
+        "container over max_weight is flagged over_limit (with negative "
+        "remaining_capacity) without rejecting the request, and the "
+        "response keeps the request order."
     ),
 )
 
@@ -631,6 +644,114 @@ class BatchGenealogyResponse(BaseModel):
     batches: list[BatchBalance]
 
 
+class PackingContainer(BaseModel):
+    """One container in the packing audit: capacity plus its direct item scans."""
+
+    container_id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Unique container identifier; must differ from every other "
+            "container_id in the request."
+        ),
+        examples=["PALLET-1"],
+    )
+    parent_id: str | None = Field(
+        default=None,
+        description=(
+            "container_id of the container this one is packed into, or "
+            "null/omitted for a root. Must name a container declared in "
+            "the same request; the parent links must form a forest (no cycles)."
+        ),
+        examples=["CONTAINER-A"],
+    )
+    max_weight: Decimal = Field(
+        ...,
+        ge=0,
+        description=(
+            "Maximum load capacity in target_unit (a non-negative exact "
+            "Decimal; JSON number or string accepted). A container whose "
+            "rolled-up total_weight exceeds it is flagged over_limit."
+        ),
+        examples=[10],
+    )
+    items: list[str] = Field(
+        ...,
+        description=(
+            "Raw GS1 scan strings and/or GS1 Digital Link URIs of the "
+            "goods packed directly into this container. Each must contain "
+            "exactly one AI 01 (GTIN), exactly one AI 21 (serial number) "
+            "and exactly one weight AI 310n/320n; AI 10/AI 17 are "
+            "optional. The same GTIN+serial may appear at most once "
+            "across all containers."
+        ),
+        examples=[["010950110153000321SN0001\x1d3103002000"]],
+    )
+
+
+class PackingAuditRequest(BaseModel):
+    target_unit: Literal["kg", "lb"] = Field(
+        default="kg",
+        description='Unit of max_weight and of every weight in the response: "kg" or "lb" (default "kg").',
+    )
+    containers: list[PackingContainer] = Field(
+        ...,
+        description=(
+            "Containers in arbitrary order; the audit resolves the "
+            "parent_id forest and reports results in this request order."
+        ),
+        examples=[
+            [
+                {
+                    "container_id": "PALLET-1",
+                    "max_weight": 50,
+                    "items": [],
+                }
+            ]
+        ],
+    )
+
+
+class PackingContainerResult(BaseModel):
+    """OpenAPI shape of one audited container; weights render as exact JSON numbers."""
+
+    container_id: str = Field(description="Echoed container identifier")
+    parent_id: str | None = Field(description="Echoed parent container id; null for a root")
+    max_weight: float = Field(
+        description="Echoed capacity in the target unit (six decimal places)"
+    )
+    unit: Literal["kg", "lb"] = Field(
+        description="Unit of every weight in this entry (the target unit)"
+    )
+    direct_weight: float = Field(
+        description=(
+            "Sum of the weights of the items packed directly into this "
+            "container, in the target unit (six decimal places)"
+        )
+    )
+    total_weight: float = Field(
+        description=(
+            "direct_weight plus the total_weight of every child container, "
+            "in the target unit (six decimal places)"
+        )
+    )
+    remaining_capacity: float = Field(
+        description="max_weight - total_weight; negative when over_limit (six decimal places)"
+    )
+    direct_item_count: int = Field(description="Number of items in this container's items list")
+    recursive_item_count: int = Field(
+        description="Number of distinct items in this container and all of its descendants"
+    )
+    over_limit: bool = Field(
+        description="True when the exact (unrounded) total_weight exceeds max_weight"
+    )
+
+
+class PackingAuditResponse(BaseModel):
+    target_unit: Literal["kg", "lb"]
+    containers: list[PackingContainerResult]
+
+
 SIX_PLACES = Decimal("0.000001")
 
 
@@ -788,6 +909,29 @@ def _build_genealogy_response(result: dict) -> Response:
     return Response(content=_dump(payload), media_type="application/json")
 
 
+def _build_packing_response(result: dict) -> Response:
+    """Quantize every weight half-even to six places and render exact JSON."""
+    payload = {
+        "target_unit": result["target_unit"],
+        "containers": [
+            {
+                "container_id": container["container_id"],
+                "parent_id": container["parent_id"],
+                "max_weight": _six(container["max_weight"]),
+                "unit": container["unit"],
+                "direct_weight": _six(container["direct_weight"]),
+                "total_weight": _six(container["total_weight"]),
+                "remaining_capacity": _six(container["remaining_capacity"]),
+                "direct_item_count": container["direct_item_count"],
+                "recursive_item_count": container["recursive_item_count"],
+                "over_limit": container["over_limit"],
+            }
+            for container in result["containers"]
+        ],
+    }
+    return Response(content=_dump(payload), media_type="application/json")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -883,3 +1027,26 @@ def batch_genealogy(req: BatchGenealogyRequest) -> Response:
     ) as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     return _build_genealogy_response(result)
+
+
+@app.post(
+    "/packing-audit",
+    response_model=PackingAuditResponse,
+)
+def packing_audit_endpoint(req: PackingAuditRequest) -> Response:
+    try:
+        result = packing_audit(
+            req.target_unit,
+            [
+                (
+                    container.container_id,
+                    container.parent_id,
+                    container.max_weight,
+                    container.items,
+                )
+                for container in req.containers
+            ],
+        )
+    except (PackingAuditError, PackingStructureError) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return _build_packing_response(result)

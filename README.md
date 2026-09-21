@@ -841,6 +841,130 @@ curl -X POST http://localhost:8080/batch-genealogy \
 }
 ```
 
+## 装箱装载审计 `POST /packing-audit`
+
+一次提交一组**顺序任意**的容器（托盘、周转箱等），容器可通过 `parent_id` 相互嵌套；
+按 **GTIN + 序列号（AI 01 + AI 21）** 识别每件货品，按**叶到根**汇总每个容器的
+直属货品重量与子容器重量，标记超重容器。
+
+- 请求体：`{"target_unit": "kg", "containers": [{"container_id": "PALLET-1", "parent_id": null, "max_weight": 20, "items": ["..."]}]}`。
+  `target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认 `"kg"`；`containers` 为容器数组，
+  顺序任意（子容器可以排在父容器之前），**响应按请求顺序返回**。`items` 中的每一项
+  既可以是元素串，也可以是 GS1 Digital Link URI（与 `/parse` 完全一致）。
+- 每个容器含：必填的 `container_id`（非空字符串，**全请求唯一**）、可选的 `parent_id`
+  （省略或 `null` 表示根容器；给定时必须等于本请求中某个 `container_id`）、必填的
+  `max_weight`（容量上限，以 `target_unit` 计，**非负 `Decimal`**，JSON number 或字符串
+  均可）和必填的 `items`（直属货品扫码数组，可为空）。
+- 每条货品扫码必须包含**恰好一个 AI 01**、**恰好一个 AI 21**（序列号）和**恰好一个
+  重量 AI**（310n 或 320n，允许混合千克/磅）；AI 10（批号）与 AI 17（效期）可有可无、
+  至多一个，不参与审计。任一条扫码解析失败或缺少/重复必需 AI，整个请求返回 `422`，
+  `detail.container_index` 给出容器下标、`detail.item_index` 给出容器内货品下标（均从
+  0 开始），`detail.error` 为该条扫码的原始错误（结构同 `/parse`）。
+- 容器关系必须构成**森林（一棵或多棵有根树）**，以下结构错误均整单返回 `422` 并定位
+  容器下标：
+  - **重复容器**（`DUPLICATE_CONTAINER`）：`container_id` 重复时，`container_index`
+    为当前下标、`first_container_index` 为首次出现下标；
+  - **未知父容器**（`UNKNOWN_PARENT`）：`parent_id` 指向本请求中不存在的容器，
+    `container_index` 定位出错容器；
+  - **环**（`CYCLE_DETECTED`）：父指针不得成环（容器以自身为父也是长度 1 的环），
+    `container_index` 与 `cycle` 给出环上的容器下标（`cycle` 已旋转至最小下标在前）。
+- **同一货品不得重复装载**：同一 **GTIN + 序列号** 在所有容器的全部 `items` 中只能
+  出现一次（同一容器内重复也算），否则整单 `422`（`DUPLICATE_ITEM`）：
+  `container_index` / `item_index` 为第二次出现位置，`first_container_index` /
+  `first_item_index` 为首次出现位置。
+- 重量一律使用 `Decimal` 从**原始六位数字与精度位 n** 重建，按固定系数
+  **1 lb = 0.45359237 kg** 换算到 `target_unit`。汇总按**叶到根**进行：每个容器的
+  `direct_weight` 为其直属货品重量之和，`total_weight` = 直属货品重量 + 全部子容器的
+  `total_weight`；`recursive_item_count` 同理递归统计货品数。
+- **超重不报错**：某容器的（未舍入的精确）`total_weight` 超过 `max_weight` 时仍返回
+  完整审计结果，仅将该容器标记为 `"over_limit": true`，其 `remaining_capacity`
+  （= `max_weight - total_weight`）为负值；恰好等于上限不算超重。所有重量仅在响应时
+  按**六位小数 half-even（银行家舍入）**输出为 JSON 数字（如 `2.513000`）；超重判定
+  用舍入前的精确值。
+- 响应：`target_unit` 与**按请求顺序**排列的 `containers` 数组，每项含 `container_id`、
+  `parent_id`（回显）、`max_weight`、`unit`、`direct_weight`、`total_weight`、
+  `remaining_capacity`、`direct_item_count`（直属货品数）、`recursive_item_count`
+  （直属 + 全部子容器内货品数）与 `over_limit`。
+- `containers` 为空数组时返回 `200` 与空的 `containers`。
+
+请求示例（托盘 `PALLET-1` 限重 20 kg，直属 6 kg；箱 `BOX-A` 装入 2 kg 与 25.13 lb
+两件货并作为其子容器；箱 `BOX-B` 再装入 `BOX-A`，直属 1 kg）：
+
+```bash
+curl -X POST http://localhost:8080/packing-audit \
+  -H "Content-Type: application/json" \
+  -d '{"target_unit": "kg", "containers": [{"container_id": "PALLET-1", "max_weight": 20, "items": ["010950110153000321P13103006000"]}, {"container_id": "BOX-A", "parent_id": "PALLET-1", "max_weight": 5, "items": ["010950110153000321A13103002000", "010950110153000321A23202002513"]}, {"container_id": "BOX-B", "parent_id": "BOX-A", "max_weight": 100, "items": ["010000000000001721B13103001000"]}]}'
+```
+
+`BOX-B` 总重 1 kg；`BOX-A` 直属 `2 + 25.13 × 0.45359237 = 13.3987762581 kg`、
+加子箱共 14.398776 kg，超过 5 kg 上限；托盘含直属 6 kg 与两个子箱共 20.398776 kg，
+同样超重（`remaining_capacity` 为负），但响应 `200 OK` 且结果完整：
+
+```json
+{
+  "target_unit": "kg",
+  "containers": [
+    {"container_id": "PALLET-1", "parent_id": null,   "max_weight": 20.000000, "unit": "kg", "direct_weight": 6.000000,  "total_weight": 20.398776, "remaining_capacity": -0.398776, "direct_item_count": 1, "recursive_item_count": 4, "over_limit": true},
+    {"container_id": "BOX-A",    "parent_id": "PALLET-1", "max_weight": 5.000000, "unit": "kg", "direct_weight": 13.398776, "total_weight": 14.398776, "remaining_capacity": -9.398776, "direct_item_count": 2, "recursive_item_count": 3, "over_limit": true},
+    {"container_id": "BOX-B",    "parent_id": "BOX-A", "max_weight": 100.000000, "unit": "kg", "direct_weight": 1.000000,  "total_weight": 1.000000,  "remaining_capacity": 99.000000, "direct_item_count": 1, "recursive_item_count": 1, "over_limit": false}
+  ]
+}
+```
+
+同一货品被重复装载时返回 `422`，两次出现的容器/货品下标一并给出：
+
+```json
+{
+  "detail": {
+    "container_index": 1,
+    "item_index": 0,
+    "first_container_index": 0,
+    "first_item_index": 0,
+    "error": {
+      "error": "DUPLICATE_ITEM",
+      "message": "container 1 item 0: item GTIN '09501101530003' serial 'SN1' was already loaded at container 0 item 0; an item may be loaded only once",
+      "expected": "item first seen at container 0 item 0 to be the only occurrence",
+      "found": "GTIN '09501101530003' serial 'SN1' at container 1 item 0"
+    }
+  }
+}
+```
+
+父容器不存在、容器关系成环、容器 id 重复时同样返回 `422`，下例为父子成环
+（`cycle` 给出环上下标，已旋转至最小下标在前）：
+
+```json
+{
+  "detail": {
+    "container_index": 0,
+    "cycle": [0, 1],
+    "error": {
+      "error": "CYCLE_DETECTED",
+      "message": "containers 0 -> 1 -> 0 form a parent/child cycle; the container relationships must form a forest",
+      "expected": "an acyclic container forest",
+      "found": "cycle 0 -> 1 -> 0"
+    }
+  }
+}
+```
+
+扫码解析或结构错误与 `/batch-genealogy` 同形，`detail.container_index` 与
+`detail.item_index` 定位出错货品：
+
+```json
+{
+  "detail": {
+    "container_index": 0,
+    "item_index": 1,
+    "error": {
+      "error": "MISSING_AI",
+      "message": "item 1: missing required AI 21 (serial number)",
+      "expected": "exactly one AI 01 (GTIN), exactly one AI 21 (serial number), and exactly one weight AI 310n/320n"
+    }
+  }
+}
+```
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -895,13 +1019,14 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy、/packing-audit）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心：不可变声明式 AI 注册表（精确 AI + 带精度位参数的 310n/320n 族）、两载体共享的最长匹配识别器与值校验分派
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
   recall.py   # 召回范围盘点：GTIN+序列号实物去重与冲突检测、有序规则（GTIN+批号集合+效期闭区间）首命中归组、未命中汇总
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
   genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
+  packing.py  # 装箱装载审计：容器森林校验（重复容器/未知父容器/环）、GTIN+序列号重复装载检测、叶到根直属与递归重量/货品数汇总、over_limit 超重标记
 tests/
   test_parse.py
   test_ai_registry.py       # 不可变注册表：启动期声明校验、只读性与共享识别器（完整键/最长匹配）
@@ -911,6 +1036,7 @@ tests/
   test_recall_impact.py
   test_trace_audit.py
   test_batch_genealogy.py
+  test_packing_audit.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
